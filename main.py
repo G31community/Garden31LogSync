@@ -1,25 +1,29 @@
 """
 tend_export_to_two_tables.py
 
-Reads a Tend export CSV with multiple sections (Container Sow / Transplant / Precision Sow)
+Reads a Tend task-list CSV (Container Sow / Transplant / Precision Sow)
 and writes to two Supabase tables:
 
 1) gh_planting_log: Container Sow rows
 2) row_planting_log: Transplant + Precision Sow rows with these columns:
-   - Plant Name        (from Planting)
-   - Variety           (from Planting)
+   - Plant Name        (from Crop)
+   - Variety           (from Crop)
    - Location          (from Location)
-   - Spacing           (from In-row Spacing)
+   - Spacing           (from In-row spacing)
    - Direct/Transplant (Transplant -> "Transplant", Precision Sow -> "Direct")
 
-Required CSV columns (in section headers):
-- Task Id
+Required CSV columns:
+- Planting ID
 - Task Type
 - Start Date
-- Planting
-- Seeds Needed
+- Crop
 - Location
-- In-row Spacing
+- In-row spacing
+
+Optional:
+- Seeds Needed  (e.g. "1,000 seeds" / "63 seedlings" -> Quantity)
+
+Also accepts the older multi-section Tend export (Task Id / Planting / Seeds Needed).
 
 Env:
   SUPABASE_URL
@@ -29,10 +33,12 @@ Env:
 
 Run:
   pip install pandas python-dateutil supabase
-  python tend_export_to_two_tables.py "/path/to/ExportTask.csv"
+  python main.py                                      # latest from SharePoint
+  python main.py "/path/to/task-list.csv"             # local file
 """
 
 import os
+import re
 import sys
 import csv
 import tempfile
@@ -251,19 +257,30 @@ def parse_date(value) -> Optional[str]:
     except Exception:
         return None
 
-# Return cleaned string
 def to_number(value) -> Optional[float]:
-    if value is None:
+    """
+    Extract a number from Tend CSV values.
+    Examples: "1,000 seeds" -> 1000, "63 seedlings" -> 63, "3 in" -> 3, "59" -> 59
+    Returns int when the value is whole (Postgres integer columns reject "63.0").
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     s = str(value).strip()
     if not s:
         return None
+    # Prefer the first number (commas allowed), ignoring unit text
+    match = re.search(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", s)
+    if not match:
+        return None
     try:
-        return s.replace(",", "")
+        num = float(match.group(0).replace(",", ""))
+        if num.is_integer():
+            return int(num)
+        return num
     except Exception:
         return None
 
-# Splits Planting column in CSV to "PLant Name" and "Variety"
+# Splits Crop/Planting column in CSV to "Plant Name" and "Variety"
 def split_planting(value: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Example:
@@ -282,8 +299,31 @@ def split_planting(value: str) -> Tuple[Optional[str], Optional[str]]:
     return (plant_name, variety)
 
 
+def normalize_location(value) -> Optional[str]:
+    """
+    Collapse redundant farm prefix from Tend locations.
+    "Montgomery > Montgomery - A > Bed 2" -> "Montgomery - A > Bed 2"
+    "Anza > Anza - B > Bed 12" -> "Anza - B > Bed 12"
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+
+    parts = [p.strip() for p in s.split(">") if p.strip()]
+    if len(parts) >= 2:
+        farm = parts[0]
+        second = parts[1]
+        if second == farm or second.startswith(f"{farm} -") or second.startswith(f"{farm}-"):
+            parts = parts[1:]
+    return " > ".join(parts)
+
 def clean_headers(headers: List[str]) -> List[str]:
     headers = [h.strip() if h is not None else "" for h in headers]
+    # Strip UTF-8 BOM from first header if present
+    if headers and headers[0].startswith("\ufeff"):
+        headers[0] = headers[0].lstrip("\ufeff")
     while headers and headers[-1] == "":
         headers.pop()
     return headers
@@ -296,25 +336,51 @@ def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, str]:
         row = row + [""] * (len(headers) - len(row))
     return {headers[i]: row[i] for i in range(len(headers))}
 
-# Going through and dividing the CSV file into multiple sections (Container Sow --> GH; Transplant, Precision Sow --> Row)
+
+def _header_names_lower(headers: List[str]) -> set:
+    return {h.strip().lower() for h in headers if h and h.strip()}
+
+
+def _is_header_row(row: List[str]) -> bool:
+    """True for new flat task-list headers or legacy multi-section 'Task Id' headers."""
+    if not row:
+        return False
+    first = (row[0] or "").strip().lstrip("\ufeff")
+    if first == "Task Id":
+        return True
+    names = _header_names_lower(clean_headers(row))
+    # New Tend task-list export
+    return "planting id" in names and "task type" in names
+
+
+def _row_has_id(rec: Dict[str, str]) -> bool:
+    for key in ("Planting ID", "Planting Id", "Task Id"):
+        val = rec.get(key)
+        if val is not None and str(val).strip():
+            return True
+    # Case-insensitive fallback
+    for k, v in rec.items():
+        if k.strip().lower() in {"planting id", "task id"} and str(v or "").strip():
+            return True
+    return False
+
+
 def read_tend_multisection_csv(path: str) -> pd.DataFrame:
     """
-    Reads Tend export CSVs that contain multiple sections with repeated headers.
-    Collects all data rows after each 'Task Id' header line.
+    Reads Tend task-list CSVs (single header) and older multi-section exports
+    that repeat a 'Task Id' header per section.
     """
     all_rows: List[Dict[str, str]] = []
     current_headers: Optional[List[str]] = None
 
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+    # utf-8-sig strips a leading BOM if present
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         reader = csv.reader(f)
         for row in reader:
-            if not row:
+            if not row or all(not (c or "").strip() for c in row):
                 continue
 
-            first = (row[0] or "").strip()
-
-            # Header line for a section
-            if first == "Task Id":
+            if _is_header_row(row):
                 current_headers = clean_headers(row)
                 continue
 
@@ -325,7 +391,7 @@ def read_tend_multisection_csv(path: str) -> pd.DataFrame:
             rec = row_to_dict(current_headers, row)
 
             # Skip non-data rows
-            if not rec.get("Task Id"):
+            if not _row_has_id(rec):
                 continue
 
             all_rows.append(rec)
@@ -333,80 +399,86 @@ def read_tend_multisection_csv(path: str) -> pd.DataFrame:
     return pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
 
 
+def _resolve_column(df_columns_lower: Dict[str, str], candidates: List[str]) -> Optional[str]:
+    for name in candidates:
+        col = df_columns_lower.get(name.lower())
+        if col is not None:
+            return col
+    return None
+
+
 # ---------- Transform ----------
 
 def transform(df: pd.DataFrame) -> pd.DataFrame:
     # Show what columns we actually have
     print(f"DEBUG: Available columns in CSV: {sorted(df.columns.tolist())}")
-    
-    # Required columns (case-insensitive matching)
-    required_base = {
-        "Task Id",
-        "Task Type",
-        "Start Date",
-        "Planting",
-        "Seeds Needed",
-        "Location",
-    }
-    
-    # Optional columns (try different variations)
-    optional = {
-        "In-row Spacing",
-        "In-Row Spacing",
-        "In row Spacing",
-        "In Row Spacing",
-    }
-    
-    # Normalize column names (case-insensitive)
-    df_columns_lower = {col.lower(): col for col in df.columns}
-    required_found = {}
-    missing_required = []
-    
-    for req_col in required_base:
-        req_lower = req_col.lower()
-        if req_lower in df_columns_lower:
-            required_found[req_col] = df_columns_lower[req_lower]
-        else:
-            missing_required.append(req_col)
-    
-    if missing_required:
-        raise ValueError(f"Missing required columns in parsed data: {sorted(missing_required)}\n"
-                        f"Available columns: {sorted(df.columns.tolist())}")
-    
-    # Find optional spacing column
-    spacing_col = None
-    for opt_col in optional:
-        opt_lower = opt_col.lower()
-        if opt_lower in df_columns_lower:
-            spacing_col = df_columns_lower[opt_lower]
-            print(f"DEBUG: Found spacing column: '{spacing_col}'")
-            break
-    
-    if not spacing_col:
-        print("WARNING: 'In-row Spacing' column not found, will set Spacing to None")
 
-    # Use normalized column names
-    task_id_col = required_found["Task Id"]
-    task_type_col = required_found["Task Type"]
-    start_date_col = required_found["Start Date"]
-    planting_col = required_found["Planting"]
-    seeds_needed_col = required_found["Seeds Needed"]
-    location_col = required_found["Location"]
+    df_columns_lower = {col.lower(): col for col in df.columns}
+
+    # New format: Planting ID / Crop; legacy: Task Id / Planting
+    id_col = _resolve_column(df_columns_lower, ["Planting ID", "Planting Id", "Task Id"])
+    task_type_col = _resolve_column(df_columns_lower, ["Task Type"])
+    start_date_col = _resolve_column(df_columns_lower, ["Start Date"])
+    planting_col = _resolve_column(df_columns_lower, ["Crop", "Planting"])
+    location_col = _resolve_column(df_columns_lower, ["Location"])
+    seeds_needed_col = _resolve_column(df_columns_lower, ["Seeds Needed"])
+    spacing_col = _resolve_column(
+        df_columns_lower,
+        [
+            "In-row spacing",
+            "In-row Spacing",
+            "In-Row Spacing",
+            "In row Spacing",
+            "In Row Spacing",
+        ],
+    )
+
+    missing = []
+    if not id_col:
+        missing.append("Planting ID (or Task Id)")
+    if not task_type_col:
+        missing.append("Task Type")
+    if not start_date_col:
+        missing.append("Start Date")
+    if not planting_col:
+        missing.append("Crop (or Planting)")
+    if not location_col:
+        missing.append("Location")
+
+    if missing:
+        raise ValueError(
+            f"Missing required columns in parsed data: {sorted(missing)}\n"
+            f"Available columns: {sorted(df.columns.tolist())}"
+        )
+
+    if spacing_col:
+        print(f"DEBUG: Found spacing column: '{spacing_col}'")
+    else:
+        print("WARNING: 'In-row spacing' column not found, will set Spacing to None")
+
+    if not seeds_needed_col:
+        print("WARNING: 'Seeds Needed' column not found, will set Quantity to None")
 
     plant_name, variety = zip(*df[planting_col].map(split_planting))
 
     # Supabase Column Name : CSV Column Name mapping
     spacing_data = df[spacing_col].map(to_number) if spacing_col else pd.Series([None] * len(df))
-    
+    quantity_data = (
+        df[seeds_needed_col].map(to_number)
+        if seeds_needed_col
+        else pd.Series([None] * len(df))
+    )
+
     out = pd.DataFrame(
         {
-            "Tend ID": df[task_id_col].astype(str).str.strip(),
-            "task_type": df[task_type_col].astype(str).str.strip(), # not a supabase column, meant to map rows into either Direct or Transplant for Direct/Transplant column
+            "Tend ID": df[id_col].astype(str).str.strip(),
+            # not a supabase column; used to map Direct vs Transplant
+            "task_type": df[task_type_col].astype(str).str.strip(),
             "Date": df[start_date_col].map(parse_date),
             "Plant Name": pd.Series(plant_name, dtype="string"),
             "Variety": pd.Series(variety, dtype="string"),
-            "Quantity": df[seeds_needed_col].map(to_number),
-            "Location": df[location_col].astype(str).str.strip(),
+            "Quantity": quantity_data,
+            "Location": df[location_col].map(normalize_location),
             "Spacing": spacing_data,
         }
     )
@@ -418,23 +490,48 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # Inserting row-by-row into Supabase
+def _json_safe_value(v):
+    """Coerce values so PostgREST integer columns get ints, not 63.0 floats."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if hasattr(v, "item"):  # numpy scalar
+        try:
+            v = v.item()
+            if isinstance(v, float) and v.is_integer():
+                return int(v)
+            return v
+        except Exception:
+            return v
+    return v
+
+
+def rows_for_upsert(rows: List[dict]) -> List[dict]:
+    return [{k: _json_safe_value(v) for k, v in row.items()} for row in rows]
+
+
 def upsert_table(sb, table: str, rows: List[dict], conflict_col: str = "Tend ID"):
     if not rows:
         print(f"[{table}] No rows to upsert.")
         return
-    sb.table(table).upsert(rows, on_conflict=conflict_col).execute()
-    print(f"[{table}] Upserted {len(rows)} rows (on_conflict={conflict_col}).")
+    payload = rows_for_upsert(rows)
+    sb.table(table).upsert(payload, on_conflict=conflict_col).execute()
+    print(f"[{table}] Upserted {len(payload)} rows (on_conflict={conflict_col}).")
 
 
 # ---------- Main ----------
 
 def main():
-    print("Fetching latest CSV from OneDrive/SharePoint...")
-
-    csv_path = fetch_latest_csv()
-    if not csv_path:
-        print("No CSV files found in the configured folder. Exiting.")
-        return
+    if len(sys.argv) > 1:
+        csv_path = sys.argv[1]
+        print(f"Using local CSV: {csv_path}")
+    else:
+        print("Fetching latest CSV from OneDrive/SharePoint...")
+        csv_path = fetch_latest_csv()
+        if not csv_path:
+            print("No CSV files found in the configured folder. Exiting.")
+            return
 
     # Supabase config
     supabase_url = os.environ["SUPABASE_URL"]
