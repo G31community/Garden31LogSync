@@ -3,7 +3,7 @@ name: Tend CSV Polling Sync
 on:
   schedule:
     # Every 15 minutes
-    - cron: "*/15 * * * *"
+    - cron: "*/10080 * * * *"
   # Allow manual runs from the GitHub UI
   workflow_dispatch:
 
